@@ -68,10 +68,12 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
       const []; // raw linear spectrum (may be unused if log bands enabled)
   // Log-band visualization state
   bool _useLogBands = true; // переключатель логарифмических полос
-  static const int _logBandCount = 32;
+  bool _useIsoBands = true; // ISO 1/3-octave centers for "standard" look
+  static const int _defaultLogBandCount = 32;
   List<double>? _logBands; // текущее значение полос 0..1
-  List<double> _peakHold = List.filled(_logBandCount, 0.0);
+  List<double> _peakHold = List.filled(_defaultLogBandCount, 0.0);
   List<double>? _prevLogBands; // для EMA
+  double _emaAlpha = 0.5; // сглаживание полос (0..0.95). Ниже — быстрее реакция
   Timer? _timer;
   bool _isPlaying = false;
   double _peak = 0;
@@ -83,6 +85,8 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
   int _fullComputeIntervalMs = 250; // период полного пересчета спектра
   bool _useFft = true; // режим FFT или Wave fallback
   bool _decayBetweenUpdates = true; // затухание между полными апдейтами
+  double _decayFactor =
+      0.96; // множитель затухания между апдейтами (0.90..0.999)
   // Безопасный старт: не читать сэмплы в первые N мс после старта проигрывания
   final int _safeStartMs = 1200; // немного увеличим для диагностики падения
   DateTime? _playStartedAt;
@@ -138,6 +142,11 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
     if (!_visualizationMasterEnabled) return; // не запускаем если выключено
     // Максимум частоты спектра = sampleRate/2.
     const smoothing = 0.6; // сглаживание между кадрами
+
+    // FPS/временное логирование
+    const int _logEveryMs = 500; // раз в 500 мс
+    int framesSinceLastLog = 0;
+    int lastLogStampMs = DateTime.now().millisecondsSinceEpoch;
 
     bool busy = false;
     DateTime lastCompute = DateTime.fromMillisecondsSinceEpoch(0);
@@ -211,15 +220,23 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
           _prevSpectrum = normSpec;
 
           if (_useLogBands && _useFft) {
-            final mapped = _mapFftToLogBands(
-              magnitudes: normSpec, // тут реальные спектральные амплитуды
-              sampleRate: repo.sampleRate,
-              bands: _logBandCount,
-              prevBands: _prevLogBands,
-              emaAlpha: 0.7,
-            );
+            final mapped = _useIsoBands
+                ? _mapFftToIsoBands(
+                    magnitudes: normSpec,
+                    sampleRate: repo.sampleRate,
+                    prevBands: _prevLogBands,
+                    emaAlpha: _emaAlpha,
+                  )
+                : _mapFftToLogBands(
+                    magnitudes: normSpec, // реальные спектральные амплитуды
+                    sampleRate: repo.sampleRate,
+                    bands: _defaultLogBandCount,
+                    prevBands: _prevLogBands,
+                    emaAlpha: _emaAlpha,
+                  );
             _prevLogBands = mapped;
             // Peak hold обновление
+            _ensurePeakHoldLength(mapped.length);
             for (int i = 0; i < mapped.length; i++) {
               if (mapped[i] > _peakHold[i]) {
                 _peakHold[i] = mapped[i];
@@ -241,7 +258,7 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
         } else if (_decayBetweenUpdates && _prevSpectrum != null) {
           final decayed = List<double>.from(_prevSpectrum!);
           for (int i = 0; i < decayed.length; i++) {
-            decayed[i] = (decayed[i] * 0.985).clamp(0.0, 1.0);
+            decayed[i] = (decayed[i] * _decayFactor).clamp(0.0, 1.0);
           }
           _prevSpectrum = decayed;
           limited = decayed.length > 256 ? decayed.sublist(0, 256) : decayed;
@@ -255,9 +272,19 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
           });
         }
 
-        if (++_frameCount % 30 == 0) {
+        // FPS логирование по времени, а не по количеству кадров
+        _frameCount++;
+        framesSinceLastLog++;
+        final nowStamp = DateTime.now().millisecondsSinceEpoch;
+        if (nowStamp - lastLogStampMs >= _logEveryMs) {
+          final fps = (framesSinceLastLog * 1000) / (nowStamp - lastLogStampMs);
+          final bins = _useLogBands ? (_logBands?.length ?? 0) : _fft.length;
+          lastLogStampMs = nowStamp;
+          framesSinceLastLog = 0;
           _log(
-            'Frame=$_frameCount mode=${_useFft ? 'FFT' : 'WAVE'} decay=$_decayBetweenUpdates ws=$_windowSamples upd=${_updateIntervalMs} full=${_fullComputeIntervalMs} pos=${pos.toStringAsFixed(2)}s bins=${_fft.length} peak=${_peak.toStringAsFixed(3)}',
+            'Frame=$_frameCount fps=${fps.toStringAsFixed(1)} mode=${_useFft ? 'FFT' : 'WAVE'} '
+            'decay=$_decayBetweenUpdates ws=$_windowSamples upd=${_updateIntervalMs} full=${_fullComputeIntervalMs} '
+            'pos=${pos.toStringAsFixed(2)}s bins=$bins peak=${_peak.toStringAsFixed(3)}',
           );
         }
       } catch (e) {
@@ -495,6 +522,15 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
                 },
               ),
               const SizedBox(width: 8),
+              const Text('ISO'),
+              Switch(
+                value: _useIsoBands,
+                onChanged: (v) {
+                  setState(() => _useIsoBands = v);
+                  _log('ISO bands=${v ? 'ON' : 'OFF'}');
+                },
+              ),
+              const SizedBox(width: 8),
               const Text('Интервал отрисовки:'),
               Expanded(
                 child: Slider(
@@ -534,6 +570,41 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
               ),
             ],
           ),
+          Row(
+            children: [
+              const Text('EMA α:'),
+              Expanded(
+                child: Slider(
+                  min: 0.1,
+                  max: 0.9,
+                  divisions: 8,
+                  label: _emaAlpha.toStringAsFixed(2),
+                  value: _emaAlpha,
+                  onChanged: (v) {
+                    setState(() => _emaAlpha = v);
+                    _log('EMA alpha set to ${_emaAlpha.toStringAsFixed(2)}');
+                  },
+                ),
+              ),
+              const SizedBox(width: 16),
+              const Text('Decay:'),
+              Expanded(
+                child: Slider(
+                  min: 0.90,
+                  max: 0.995,
+                  divisions: 19,
+                  label: _decayFactor.toStringAsFixed(3),
+                  value: _decayFactor,
+                  onChanged: (v) {
+                    setState(() => _decayFactor = v);
+                    _log(
+                      'Decay factor set to ${_decayFactor.toStringAsFixed(3)}',
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -547,6 +618,49 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
   }
 
   // --- Логарифмическое отображение спектра ---
+  static const List<double> _isoCenters = [
+    20,
+    25,
+    31.5,
+    40,
+    50,
+    63,
+    80,
+    100,
+    125,
+    160,
+    200,
+    250,
+    315,
+    400,
+    500,
+    630,
+    800,
+    1000,
+    1250,
+    1600,
+    2000,
+    2500,
+    3150,
+    4000,
+    5000,
+    6300,
+    8000,
+    10000,
+    12500,
+    16000,
+    20000,
+  ];
+
+  void _ensurePeakHoldLength(int n) {
+    if (_peakHold.length == n) return;
+    if (_peakHold.length < n) {
+      _peakHold += List<double>.filled(n - _peakHold.length, 0.0);
+    } else {
+      _peakHold = _peakHold.sublist(0, n);
+    }
+  }
+
   List<double> _mapFftToLogBands({
     required List<double> magnitudes,
     required int sampleRate,
@@ -591,6 +705,67 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
       final db = 10 * log(avgPower + eps) / ln10; // convert to dB
       final norm = ((db + 60) / 60).clamp(0.0, 1.0); // -60..0 dB -> 0..1
       if (prevBands != null && prevBands.length == bands) {
+        out[b] = prevBands[b] * emaAlpha + norm * (1 - emaAlpha);
+      } else {
+        out[b] = norm;
+      }
+    }
+    return out;
+  }
+
+  // ISO 1/3-octave bands mapping using geometric edges around centers
+  List<double> _mapFftToIsoBands({
+    required List<double> magnitudes,
+    required int sampleRate,
+    List<double>? prevBands,
+    double emaAlpha = 0.7,
+  }) {
+    if (magnitudes.isEmpty) return const [];
+    final nyquist = sampleRate / 2.0;
+    // Build edges as geometric mean between adjacent centers; clamp to [20, nyquist]
+    final centers = _isoCenters.where((f) => f < nyquist).toList();
+    if (centers.isEmpty) return const [];
+    final edges = <double>[];
+    edges.add(
+      max(20.0, centers.first / pow(2, 1 / 6)),
+    ); // half-band below first center
+    for (int i = 0; i < centers.length - 1; i++) {
+      final e = sqrt(centers[i] * centers[i + 1]);
+      edges.add(e);
+    }
+    edges.add(
+      min(20000.0, centers.last * pow(2, 1 / 6)),
+    ); // half-band above last center
+
+    // Power spectrum
+    final power = List<double>.generate(magnitudes.length, (i) {
+      final m = magnitudes[i];
+      return m * m;
+    }, growable: false);
+
+    final out = List<double>.filled(centers.length, 0.0);
+    for (int b = 0; b < centers.length; b++) {
+      final f0 = edges[b];
+      final f1 = b + 1 < edges.length ? edges[b + 1] : edges[b] * pow(2, 1 / 3);
+      final f0c = f0.clamp(20.0, nyquist);
+      final f1c = f1.clamp(20.0, nyquist);
+      if (f1c <= f0c) {
+        out[b] = 0;
+        continue;
+      }
+      final bin0 = ((f0c / nyquist) * (magnitudes.length - 1)).floor();
+      final bin1 = ((f1c / nyquist) * (magnitudes.length - 1)).ceil();
+      double sum = 0;
+      int count = 0;
+      for (int i = bin0; i <= bin1 && i < power.length; i++) {
+        sum += power[i];
+        count++;
+      }
+      final avgPower = count > 0 ? sum / max(1, count) : 0.0;
+      const eps = 1e-12;
+      final db = 10 * log(avgPower + eps) / ln10; // dBFS approx
+      final norm = ((db + 60) / 60).clamp(0.0, 1.0); // -60..0 dB -> 0..1
+      if (prevBands != null && prevBands.length == centers.length) {
         out[b] = prevBands[b] * emaAlpha + norm * (1 - emaAlpha);
       } else {
         out[b] = norm;
