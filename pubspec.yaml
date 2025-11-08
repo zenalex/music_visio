@@ -34,8 +34,9 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  # Audio engine & playback (SoLoud) plugin
-  flutter_soloud: ^3.4.2 # (проверьте на pub.dev актуальную версию)
+  # Playback on Windows via platform plugins
+  audioplayers: ^6.0.0
+  # No FFmpeg plugin (Windows): using external ffmpeg executable via Process.run
 
 dev_dependencies:
   flutter_test:

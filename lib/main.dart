@@ -1,14 +1,13 @@
-// Clean rewritten file implementing audio visualizer
+// Clean rewritten file implementing audio visualizer (audioplayers + FFmpeg PCM repo)
+// ignore_for_file: unnecessary_brace_in_string_interps
+
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
-import 'dart:ui';
-import 'dart:io' as io;
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart' show listEquals, compute;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'
-    show rootBundle; // для загрузки asset как bytes
-import 'package:flutter_soloud/flutter_soloud.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'pcm_repository.dart';
 
 void _log(String msg, [Object? err, StackTrace? st]) {
   // Единый формат лога
@@ -27,18 +26,6 @@ Future<void> main() async {
       FlutterError.onError = (details) {
         _log('FlutterError', details.exception, details.stack);
       };
-
-      _log('Initializing SoLoud...');
-      final soloud = SoLoud.instance;
-      try {
-        await soloud.init();
-        _log('SoLoud initialized (isInitialized=${soloud.isInitialized})');
-      } catch (e, st) {
-        _log('SoLoud init failed', e, st);
-      }
-      soloud.setVisualizationEnabled(true);
-      soloud.setFftSmoothing(0.6);
-      _log('Visualization enabled=${soloud.getVisualizationEnabled()}');
       runApp(const MyApp());
     },
     (error, stack) {
@@ -71,126 +58,131 @@ class AudioVisualizerPage extends StatefulWidget {
 }
 
 class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
-  SoundHandle? _handle;
+  final _player = AudioPlayer();
+  PcmRepository? _pcmRepo;
+  bool _decodeReady = false;
+  String _decodeInfo = '';
   List<double> _fft = const [];
   Timer? _timer;
   bool _isPlaying = false;
   double _peak = 0;
-  Uint8List? _assetBuffer; // кешированное содержимое mp3 для чтения сэмплов
   List<double>? _prevSpectrum; // для сглаживания между кадрами
   int _frameCount = 0; // счетчик кадров для условного логирования
-  String? _tmpFilePath; // путь к временному mp3 (для readSamplesFromFile)
-  io.Directory? _tmpDir; // чтобы удалить позже
+  // Настройки визуализации
+  int _windowSamples = 512;
+  int _updateIntervalMs = 60; // таймер перерисовки
+  int _fullComputeIntervalMs = 250; // период полного пересчета спектра
+  bool _useFft = true; // режим FFT или Wave fallback
+  bool _decayBetweenUpdates = true; // затухание между полными апдейтами
+  // Безопасный старт: не читать сэмплы в первые N мс после старта проигрывания
+  final int _safeStartMs = 1200; // немного увеличим для диагностики падения
+  DateTime? _playStartedAt;
+  bool _visualizationMasterEnabled =
+      true; // глобальный выключатель визуализации
+  Timer? _heartbeatTimer; // периодический лог для отслеживания жизни процесса
 
   @override
   void initState() {
     super.initState();
-    _loadAndPlay();
-    _startFftPolling();
+    _initPlayback();
+    _startHeartbeat();
+    if (_visualizationMasterEnabled) {
+      _startFftPolling();
+    } else {
+      _log('Visualization master OFF: spectrum disabled.');
+    }
   }
 
-  Future<void> _loadAndPlay() async {
+  Future<void> _initPlayback() async {
     try {
-      final soloud = SoLoud.instance;
-
-      // Загружаем asset как bytes, чтобы затем использовать readSamplesFromMem
-      final assetPath = 'assets/audio/sample.mp3';
-      _log('Loading asset bytes: $assetPath');
-      final byteData = await rootBundle.load(assetPath);
-      _assetBuffer = byteData.buffer.asUint8List();
-      _log('Asset bytes loaded length=${_assetBuffer!.length}');
-
-      // Пишем байты в временный файл, чтобы не копировать весь буфер в изолят каждые 60 мс
-      _tmpDir = await io.Directory.systemTemp.createTemp('music_visio_');
-      final file = io.File('${_tmpDir!.path}/sample.mp3');
-      await file.writeAsBytes(_assetBuffer!, flush: false);
-      _tmpFilePath = file.path;
-      _log('Temp file created at $_tmpFilePath');
-
-      // Загружаем звук из файла (меньше нагрузки на память)
-      final source = await soloud.loadFile(
-        _tmpFilePath!,
-        mode: LoadMode.memory,
+      // 1) Подготавливаем PCM репозиторий (FFmpeg decode офлайн)
+      final repo = PcmRepository(
+        assetPath: 'assets/audio/sample.mp3',
+        stereo: true, // стерео для плеера, моно смешаем для визуализации
+        sampleRate: 44100,
       );
-      _log(
-        'AudioSource loaded (hash=${source.soundHash.hash}). Starting playback...',
-      );
-      final h = await soloud.play(source, volume: 1.0);
-      _log('Playback started (handle=${h.id})');
+      await repo.ensureReady();
+      _pcmRepo = repo;
+      _decodeReady = true;
+      _decodeInfo =
+          'PCM ready: ${repo.sampleRate} Hz, ch=${repo.channels}, totalFrames=${repo.totalFrames}';
+
+      // 2) Инициализируем аудио-плеер и запускаем воспроизведение исходного mp3 из assets
+      // Для audioplayers путь указывается относительно корня assets в pubspec
+      await _player.play(AssetSource('audio/sample.mp3'));
       setState(() {
-        _handle = h;
         _isPlaying = true;
       });
-    } catch (e) {
-      _log('Loading/playback failed', e is Exception ? e : Exception(e));
+      _playStartedAt = DateTime.now();
+      _log('Playback started (audioplayers)');
+    } catch (e, st) {
+      _log('Init playback failed', e, st);
     }
   }
 
   void _startFftPolling() {
-    const frameInterval = Duration(milliseconds: 50); // ~20 FPS отрисовки
-    const windowSamples = 512; // меньше окно -> ниже нагрузка
-    // Максимум частоты спектра = sampleRate/2. Предполагаем 44100.
-    const sampleRate = 44100.0;
-    const smoothing =
-        0.6; // доп. сглаживание между кадрами (не путать с setFftSmoothing)
+    if (!_visualizationMasterEnabled) return; // не запускаем если выключено
+    // Максимум частоты спектра = sampleRate/2.
+    const smoothing = 0.6; // сглаживание между кадрами
 
     bool busy = false;
     DateTime lastCompute = DateTime.fromMillisecondsSinceEpoch(0);
-    _timer = Timer.periodic(frameInterval, (_) async {
-      if (busy) return;
+    _timer?.cancel();
+    _timer = Timer.periodic(Duration(milliseconds: _updateIntervalMs), (
+      _,
+    ) async {
+      if (busy || !mounted) return;
       busy = true;
-      if (!mounted) return;
-      final h = _handle;
-      final path = _tmpFilePath;
-      if (h == null || path == null) {
-        busy = false;
-        return; // ещё не готовы
-      }
-      final soloud = SoLoud.instance;
       try {
-        // Текущее положение воспроизведения
-        final pos = soloud.getPosition(h).inMilliseconds / 1000.0;
-        if (pos <= 0) {
-          busy = false;
+        if (!_visualizationMasterEnabled) return; // двойная защита
+        final repo = _pcmRepo;
+        if (!_decodeReady || repo == null) return;
+        final posMs =
+            (await _player.getCurrentPosition())?.inMilliseconds.toDouble() ??
+            0.0;
+        final pos = posMs / 1000.0;
+        if (pos <= 0) return;
+
+        final now = DateTime.now();
+        // Безопасный старт: не трогаем чтение сэмплов первые _safeStartMs мс
+        final started = _playStartedAt;
+        if (started != null &&
+            now.difference(started).inMilliseconds < _safeStartMs) {
           return;
         }
-        // Обновляем спектр не чаще, чем раз в 250 мс, чтобы не плодить изолятов
-        final now = DateTime.now();
+        final mustRecompute =
+            now.difference(lastCompute).inMilliseconds >=
+            _fullComputeIntervalMs;
+
         List<double>? limited;
-        double peak = 0.0;
-        if (now.difference(lastCompute).inMilliseconds >= 250) {
+        double peak = _peak;
+        if (mustRecompute) {
           lastCompute = now;
 
-          final windowDuration = windowSamples / sampleRate; // ~11.6ms
-          final startTime = max(0.0, pos - windowDuration);
-          final endTime = pos; // читаем до текущего времени
+          final windowSamples = _windowSamples;
+          final sr = repo.sampleRate;
+          final endFrame = (pos * sr).round();
+          final samples = await repo.readMonoWindow(endFrame, windowSamples);
+          if (samples.isEmpty) return;
 
-          // Читаем равномерно распределённые сэмплы по времени из файла
-          final samples = await soloud.readSamplesFromFile(
-            path,
-            windowSamples,
-            startTime: startTime,
-            endTime: endTime,
-            average: false,
-          );
-
-          if (samples.isEmpty) {
-            busy = false;
-            return;
+          List<double> normSpec;
+          if (_useFft) {
+            try {
+              final spectrum = await compute(_computeSpectrumIsolate, samples);
+              normSpec = List<double>.generate(spectrum.length, (i) {
+                final v = spectrum[i];
+                return log(1 + v * 50) / log(51); // 0..1
+              });
+            } catch (e) {
+              _log(
+                'Isolate FFT error, fallback to wave',
+                e is Exception ? e : Exception(e),
+              );
+              normSpec = _waveFallback(samples);
+            }
+          } else {
+            normSpec = _waveFallback(samples);
           }
-
-          // Применяем Hann окно
-          final windowed = Float32List(samples.length);
-          for (int i = 0; i < samples.length; i++) {
-            final w = 0.5 * (1 - cos(2 * pi * i / (samples.length - 1)));
-            windowed[i] = samples[i] * w;
-          }
-
-          final spectrum = _fftCompute(windowed); // N/2
-          final normSpec = List<double>.generate(spectrum.length, (i) {
-            final v = spectrum[i];
-            return log(1 + v * 50) / log(51); // 0..1 примерно
-          });
 
           if (_prevSpectrum != null &&
               _prevSpectrum!.length == normSpec.length) {
@@ -203,23 +195,16 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
 
           limited = normSpec.length > 256 ? normSpec.sublist(0, 256) : normSpec;
           peak = limited.isEmpty ? 0.0 : limited.reduce(max);
-        } else {
-          // Между полными пересчётами — плавно затухаем предыдущий спектр
-          if (_prevSpectrum != null) {
-            final decayed = List<double>.from(_prevSpectrum!);
-            for (int i = 0; i < decayed.length; i++) {
-              decayed[i] = (decayed[i] * 0.985).clamp(0.0, 1.0);
-            }
-            _prevSpectrum = decayed;
-            limited = decayed.length > 256 ? decayed.sublist(0, 256) : decayed;
-            peak = limited.isEmpty ? 0.0 : limited.reduce(max);
+        } else if (_decayBetweenUpdates && _prevSpectrum != null) {
+          final decayed = List<double>.from(_prevSpectrum!);
+          for (int i = 0; i < decayed.length; i++) {
+            decayed[i] = (decayed[i] * 0.985).clamp(0.0, 1.0);
           }
+          _prevSpectrum = decayed;
+          limited = decayed.length > 256 ? decayed.sublist(0, 256) : decayed;
+          peak = limited.isEmpty ? 0.0 : limited.reduce(max);
         }
 
-        if (!mounted) {
-          busy = false;
-          return;
-        }
         if (limited != null) {
           setState(() {
             _fft = limited!;
@@ -227,10 +212,9 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
           });
         }
 
-        // Логируем каждые 30 кадров чтобы не засорять вывод
         if (++_frameCount % 30 == 0) {
           _log(
-            'Frame=$_frameCount pos=${pos.toStringAsFixed(2)}s bins=${_fft.length} peak=${_peak.toStringAsFixed(3)}',
+            'Frame=$_frameCount mode=${_useFft ? 'FFT' : 'WAVE'} decay=$_decayBetweenUpdates ws=$_windowSamples upd=${_updateIntervalMs} full=${_fullComputeIntervalMs} pos=${pos.toStringAsFixed(2)}s bins=${_fft.length} peak=${_peak.toStringAsFixed(3)}',
           );
         }
       } catch (e) {
@@ -241,44 +225,67 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
     });
   }
 
-  // Быстрая реализация FFT (Cooley–Tukey, radix-2, только magnitudes) над real сигналом.
-  // Возвращает список длиной N/2 с мощностями спектра.
-  List<double> _fftCompute(Float32List input) {
-    final n = input.length;
-    // Убедимся что n — степень двойки
-    if ((n & (n - 1)) != 0) {
-      // Если нет, дополним нулями до ближайшей степени двойки
-      int pow2 = 1;
-      while (pow2 < n) pow2 <<= 1;
-      final padded = Float32List(pow2);
-      padded.setRange(0, n, input);
-      return _fftCompute(padded);
+  void _togglePlayPause() {
+    if (_isPlaying) {
+      _player.pause();
+    } else {
+      _player.resume();
     }
+    setState(() => _isPlaying = !_isPlaying);
+  }
 
-    final real = Float32List.fromList(input);
-    final imag = Float32List(n);
-
-    // Bit-reversal permutation
-    int j = 0;
+  // Изолятная функция FFT: получает Float32List исходных PCM сэмплов, применяет Hann и FFT.
+  // Выносим вычисления с учётом что compute передаст копию списка.
+  // Помечаем @pragma для надёжного доступа при tree-shake.
+  @pragma('vm:entry-point')
+  static List<double> _computeSpectrumIsolate(Float32List samples) {
+    final n = samples.length;
+    // Применяем Hann окно
+    final windowed = Float32List(n);
     for (int i = 0; i < n; i++) {
-      if (i < j) {
-        final tmpR = real[i];
-        real[i] = real[j];
-        real[j] = tmpR;
-        final tmpI = imag[i];
-        imag[i] = imag[j];
-        imag[j] = tmpI;
+      final w = 0.5 * (1 - cos(2 * pi * i / (n - 1)));
+      windowed[i] = samples[i] * w;
+    }
+    // FFT radix-2
+    int m = 1;
+    while (m < n) {
+      m <<=
+          1; // гарантируем степень двойки (n уже должен быть степенью, иначе паддинг)
+    }
+    final size = m;
+    final real = Float32List(size);
+    final imag = Float32List(size);
+    if (size == n) {
+      for (int i = 0; i < n; i++) {
+        real[i] = windowed[i];
       }
-      int m = n >> 1;
-      while (j >= m && m > 0) {
-        j -= m;
-        m >>= 1;
+    } else {
+      // паддинг нулями
+      for (int i = 0; i < n; i++) {
+        real[i] = windowed[i];
       }
-      j += m;
+      for (int i = n; i < size; i++) {
+        real[i] = 0.0;
+      }
     }
 
-    // FFT stages
-    for (int len = 2; len <= n; len <<= 1) {
+    // битовое развёртывание
+    int j = 0;
+    for (int i = 0; i < size; i++) {
+      if (i < j) {
+        final tmp = real[i];
+        real[i] = real[j];
+        real[j] = tmp;
+      }
+      int bit = size >> 1;
+      while (j & bit != 0) {
+        j &= ~bit;
+        bit >>= 1;
+      }
+      j |= bit;
+    }
+
+    for (int len = 2; len <= size; len <<= 1) {
       final halfLen = len >> 1;
       final theta = -2 * pi / len;
       final wLenCos = cos(theta);
@@ -286,7 +293,7 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
       double wCos = 1.0;
       double wSin = 0.0;
       for (int k = 0; k < halfLen; k++) {
-        for (int i = k; i < n; i += len) {
+        for (int i = k; i < size; i += len) {
           final j2 = i + halfLen;
           final tReal = wCos * real[j2] - wSin * imag[j2];
           final tImag = wCos * imag[j2] + wSin * real[j2];
@@ -301,46 +308,24 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
       }
     }
 
-    final magnitudes = List<double>.filled(n >> 1, 0.0);
-    for (int i = 0; i < (n >> 1); i++) {
+    final magnitudes = List<double>.filled(size >> 1, 0.0);
+    for (int i = 0; i < (size >> 1); i++) {
       final re = real[i];
       final im = imag[i];
-      magnitudes[i] = sqrt(re * re + im * im) / (n / 2); // нормализация
+      magnitudes[i] = sqrt(re * re + im * im) / (size / 2);
     }
     return magnitudes;
-  }
-
-  void _togglePlayPause() {
-    final h = _handle;
-    if (h == null) return;
-    final soloud = SoLoud.instance;
-    if (_isPlaying) {
-      soloud.setPause(h, true);
-    } else {
-      soloud.setPause(h, false);
-    }
-    setState(() => _isPlaying = !_isPlaying);
   }
 
   @override
   void dispose() {
     _timer?.cancel();
-    final h = _handle;
-    if (h != null) {
-      final soloud = SoLoud.instance;
-      // ignore: discarded_futures
-      _log('Stopping handle id=${h.id}');
-      soloud.stop(h); // fire-and-forget
-    }
-    // Чистим временные файлы
-    try {
-      if (_tmpDir != null && _tmpDir!.existsSync()) {
-        _log('Deleting temp dir ${_tmpDir!.path}');
-        _tmpDir!.deleteSync(recursive: true);
-      }
-    } catch (e) {
-      _log('Temp dir delete failed', e is Exception ? e : Exception(e));
-    }
+    _heartbeatTimer?.cancel();
+    // Останавливаем плеер и чистим PCM ресурсы
+    // ignore: discarded_futures
+    _player.dispose();
+    // ignore: discarded_futures
+    _pcmRepo?.dispose();
     _log('Disposed visualizer state');
     super.dispose();
   }
@@ -348,7 +333,7 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('MP3 Spectrum (SoLoud)')),
+      appBar: AppBar(title: const Text('MP3 Spectrum (audioplayers + FFmpeg)')),
       body: Column(
         children: [
           Expanded(
@@ -357,6 +342,7 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
               child: const SizedBox.expand(),
             ),
           ),
+          _buildControls(),
           Padding(
             padding: const EdgeInsets.all(12.0),
             child: Row(
@@ -370,12 +356,8 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
                 const SizedBox(width: 12),
                 ElevatedButton.icon(
                   onPressed: () async {
-                    final h = _handle;
-                    if (h != null) {
-                      final soloud = SoLoud.instance;
-                      await soloud.stop(h);
-                    }
-                    await _loadAndPlay();
+                    await _player.stop();
+                    await _player.play(AssetSource('audio/sample.mp3'));
                   },
                   icon: const Icon(Icons.replay),
                   label: const Text('Restart'),
@@ -383,9 +365,158 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
               ],
             ),
           ),
+          if (_decodeReady)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8.0),
+              child: Text(
+                _decodeInfo,
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ),
         ],
       ),
     );
+  }
+
+  Widget _buildControls() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Switch(
+                value: _visualizationMasterEnabled,
+                onChanged: (v) {
+                  setState(() => _visualizationMasterEnabled = v);
+                  _log('Master visualization=${v ? 'ON' : 'OFF'}');
+                  if (v) {
+                    _restartTimer();
+                  } else {
+                    _timer?.cancel();
+                  }
+                },
+              ),
+              const Text('Vis'),
+              const SizedBox(width: 12),
+              Switch(
+                value: _useFft,
+                onChanged: (v) {
+                  setState(() => _useFft = v);
+                  _log('Mode switched to ${v ? 'FFT' : 'WAVE'}');
+                },
+              ),
+              Text(_useFft ? 'FFT режим' : 'Wave режим'),
+              const SizedBox(width: 16),
+              Switch(
+                value: _decayBetweenUpdates,
+                onChanged: (v) {
+                  setState(() => _decayBetweenUpdates = v);
+                  _log('Decay switched to $v');
+                },
+              ),
+              const Text('Decay'),
+            ],
+          ),
+          Row(
+            children: [
+              const Text('Окно:'),
+              const SizedBox(width: 8),
+              DropdownButton<int>(
+                value: _windowSamples,
+                items: const [256, 512, 1024]
+                    .map((e) => DropdownMenuItem(value: e, child: Text('$e')))
+                    .toList(),
+                onChanged: (v) {
+                  if (v == null) return;
+                  setState(() => _windowSamples = v);
+                  _log('Window size set to $v');
+                },
+              ),
+              const SizedBox(width: 16),
+              const Text('Интервал отрисовки:'),
+              Expanded(
+                child: Slider(
+                  min: 20,
+                  max: 150,
+                  divisions: 13,
+                  label: '$_updateIntervalMs ms',
+                  value: _updateIntervalMs.toDouble(),
+                  onChanged: (val) {
+                    setState(() => _updateIntervalMs = val.round());
+                  },
+                  onChangeEnd: (_) {
+                    _log('Update interval set to $_updateIntervalMs ms');
+                    _restartTimer();
+                  },
+                ),
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              const Text('Полный пересчёт:'),
+              Expanded(
+                child: Slider(
+                  min: 150,
+                  max: 1000,
+                  divisions: 17,
+                  label: '$_fullComputeIntervalMs ms',
+                  value: _fullComputeIntervalMs.toDouble(),
+                  onChanged: (val) {
+                    setState(() => _fullComputeIntervalMs = val.round());
+                  },
+                  onChangeEnd: (_) => _log(
+                    'Full compute interval set to $_fullComputeIntervalMs ms',
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _restartTimer() {
+    _timer?.cancel();
+    if (_visualizationMasterEnabled) {
+      _startFftPolling();
+    }
+  }
+
+  // Простая энергетическая визуализация без FFT: разбиваем на полосы и берём среднее abs.
+  List<double> _waveFallback(Float32List samples) {
+    const bands = 256;
+    final slice = samples;
+    final perBand = max(1, slice.length ~/ bands);
+    final out = List<double>.filled(bands, 0.0);
+    for (int b = 0; b < bands; b++) {
+      final start = b * perBand;
+      final end = min(slice.length, start + perBand);
+      double sum = 0;
+      for (int i = start; i < end; i++) {
+        sum += slice[i].abs();
+      }
+      final avg = end > start ? sum / (end - start) : 0.0;
+      // Лог-компрессия
+      out[b] = log(1 + avg * 20) / log(21);
+    }
+    return out;
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (!mounted) return;
+      _player.getCurrentPosition().then((pos) {
+        final ms = pos?.inMilliseconds ?? -1;
+        _log(
+          'HEARTBEAT t=${DateTime.now().millisecondsSinceEpoch} posMs=${ms} vis=${_visualizationMasterEnabled} fft=${_useFft}',
+        );
+      });
+    });
   }
 }
 
