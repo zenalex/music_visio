@@ -59,17 +59,26 @@ class AudioVisualizerPage extends StatefulWidget {
 
 class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
   final _player = AudioPlayer();
+  StreamSubscription<Duration>? _posSub;
+  Duration _lastPos = Duration.zero;
   PcmRepository? _pcmRepo;
   bool _decodeReady = false;
   String _decodeInfo = '';
-  List<double> _fft = const [];
+  List<double> _fft =
+      const []; // raw linear spectrum (may be unused if log bands enabled)
+  // Log-band visualization state
+  bool _useLogBands = true; // переключатель логарифмических полос
+  static const int _logBandCount = 32;
+  List<double>? _logBands; // текущее значение полос 0..1
+  List<double> _peakHold = List.filled(_logBandCount, 0.0);
+  List<double>? _prevLogBands; // для EMA
   Timer? _timer;
   bool _isPlaying = false;
   double _peak = 0;
   List<double>? _prevSpectrum; // для сглаживания между кадрами
   int _frameCount = 0; // счетчик кадров для условного логирования
   // Настройки визуализации
-  int _windowSamples = 512;
+  int _windowSamples = 256;
   int _updateIntervalMs = 60; // таймер перерисовки
   int _fullComputeIntervalMs = 250; // период полного пересчета спектра
   bool _useFft = true; // режим FFT или Wave fallback
@@ -110,6 +119,11 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
       // 2) Инициализируем аудио-плеер и запускаем воспроизведение исходного mp3 из assets
       // Для audioplayers путь указывается относительно корня assets в pubspec
       await _player.play(AssetSource('audio/sample.mp3'));
+      // Subscribe to position updates to avoid awaiting getCurrentPosition each tick
+      _posSub?.cancel();
+      _posSub = _player.onPositionChanged.listen((d) {
+        _lastPos = d;
+      });
       setState(() {
         _isPlaying = true;
       });
@@ -137,9 +151,7 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
         if (!_visualizationMasterEnabled) return; // двойная защита
         final repo = _pcmRepo;
         if (!_decodeReady || repo == null) return;
-        final posMs =
-            (await _player.getCurrentPosition())?.inMilliseconds.toDouble() ??
-            0.0;
+        final posMs = _lastPos.inMilliseconds.toDouble();
         final pos = posMs / 1000.0;
         if (pos <= 0) return;
 
@@ -169,10 +181,15 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
           if (_useFft) {
             try {
               final spectrum = await compute(_computeSpectrumIsolate, samples);
-              normSpec = List<double>.generate(spectrum.length, (i) {
-                final v = spectrum[i];
-                return log(1 + v * 50) / log(51); // 0..1
-              });
+              // Если включены лог полосы — не преобразуем в лог сразу, оставляем magnitudes
+              if (_useLogBands) {
+                normSpec = spectrum; // передадим для дальнейшего маппинга
+              } else {
+                normSpec = List<double>.generate(spectrum.length, (i) {
+                  final v = spectrum[i];
+                  return log(1 + v * 50) / log(51); // 0..1
+                });
+              }
             } catch (e) {
               _log(
                 'Isolate FFT error, fallback to wave',
@@ -193,8 +210,34 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
           }
           _prevSpectrum = normSpec;
 
-          limited = normSpec.length > 256 ? normSpec.sublist(0, 256) : normSpec;
-          peak = limited.isEmpty ? 0.0 : limited.reduce(max);
+          if (_useLogBands && _useFft) {
+            final mapped = _mapFftToLogBands(
+              magnitudes: normSpec, // тут реальные спектральные амплитуды
+              sampleRate: repo.sampleRate,
+              bands: _logBandCount,
+              prevBands: _prevLogBands,
+              emaAlpha: 0.7,
+            );
+            _prevLogBands = mapped;
+            // Peak hold обновление
+            for (int i = 0; i < mapped.length; i++) {
+              if (mapped[i] > _peakHold[i]) {
+                _peakHold[i] = mapped[i];
+              } else {
+                _peakHold[i] = (_peakHold[i] - 0.01).clamp(0.0, 1.0);
+              }
+            }
+            _logBands = mapped;
+            peak = mapped.isEmpty ? 0.0 : mapped.reduce(max);
+            limited =
+                mapped; // для совместимости старого painter если переключим
+          } else {
+            limited = normSpec.length > 256
+                ? normSpec.sublist(0, 256)
+                : normSpec;
+            peak = limited.isEmpty ? 0.0 : limited.reduce(max);
+            _logBands = null; // не используем
+          }
         } else if (_decayBetweenUpdates && _prevSpectrum != null) {
           final decayed = List<double>.from(_prevSpectrum!);
           for (int i = 0; i < decayed.length; i++) {
@@ -321,6 +364,7 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
   void dispose() {
     _timer?.cancel();
     _heartbeatTimer?.cancel();
+    _posSub?.cancel();
     // Останавливаем плеер и чистим PCM ресурсы
     // ignore: discarded_futures
     _player.dispose();
@@ -337,9 +381,16 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
       body: Column(
         children: [
           Expanded(
-            child: CustomPaint(
-              painter: SpectrumPainter(_fft, peak: _peak),
-              child: const SizedBox.expand(),
+            child: RepaintBoundary(
+              child: CustomPaint(
+                painter: _useLogBands
+                    ? LogSpectrumPainter(
+                        bands: _logBands ?? const [],
+                        peakHolds: _peakHold,
+                      )
+                    : SpectrumPainter(_fft, peak: _peak),
+                child: const SizedBox.expand(),
+              ),
             ),
           ),
           _buildControls(),
@@ -435,6 +486,15 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
                 },
               ),
               const SizedBox(width: 16),
+              const Text('Bands:'),
+              Switch(
+                value: _useLogBands,
+                onChanged: (v) {
+                  setState(() => _useLogBands = v);
+                  _log('Log bands=${v ? 'ON' : 'OFF'}');
+                },
+              ),
+              const SizedBox(width: 8),
               const Text('Интервал отрисовки:'),
               Expanded(
                 child: Slider(
@@ -484,6 +544,59 @@ class _AudioVisualizerPageState extends State<AudioVisualizerPage> {
     if (_visualizationMasterEnabled) {
       _startFftPolling();
     }
+  }
+
+  // --- Логарифмическое отображение спектра ---
+  List<double> _mapFftToLogBands({
+    required List<double> magnitudes,
+    required int sampleRate,
+    required int bands,
+    List<double>? prevBands,
+    double emaAlpha = 0.7,
+    double minFreq = 20,
+    double maxFreq = 20000,
+  }) {
+    if (magnitudes.isEmpty) return List.filled(bands, 0);
+    final nyquist = sampleRate / 2.0;
+    final usableMax = min(maxFreq, nyquist);
+    final logMin = log(minFreq);
+    final logMax = log(usableMax);
+
+    // Power (magnitude^2)
+    final power = List<double>.generate(magnitudes.length, (i) {
+      final m = magnitudes[i];
+      return m * m;
+    }, growable: false);
+
+    final out = List<double>.filled(bands, 0);
+    for (int b = 0; b < bands; b++) {
+      final t0 = b / bands;
+      final t1 = (b + 1) / bands;
+      final f0 = exp(logMin + (logMax - logMin) * t0);
+      final f1 = exp(logMin + (logMax - logMin) * t1);
+      final bin0 = ((f0 / nyquist) * (magnitudes.length - 1)).floor();
+      final bin1 = ((f1 / nyquist) * (magnitudes.length - 1)).ceil();
+      if (bin1 <= bin0) {
+        out[b] = 0;
+        continue;
+      }
+      double sum = 0;
+      int count = 0;
+      for (int i = bin0; i <= bin1 && i < power.length; i++) {
+        sum += power[i];
+        count++;
+      }
+      final avgPower = count > 0 ? sum / count : 0.0;
+      const eps = 1e-12;
+      final db = 10 * log(avgPower + eps) / ln10; // convert to dB
+      final norm = ((db + 60) / 60).clamp(0.0, 1.0); // -60..0 dB -> 0..1
+      if (prevBands != null && prevBands.length == bands) {
+        out[b] = prevBands[b] * emaAlpha + norm * (1 - emaAlpha);
+      } else {
+        out[b] = norm;
+      }
+    }
+    return out;
   }
 
   // Простая энергетическая визуализация без FFT: разбиваем на полосы и берём среднее abs.
@@ -544,6 +657,7 @@ class SpectrumPainter extends CustomPainter {
 
     final n = fft.length;
     final barWidth = max(1.0, size.width / n);
+    final paint = Paint()..style = PaintingStyle.fill;
     for (int i = 0; i < n; i++) {
       final v = fft[i].clamp(0.0, 1.0);
       final barHeight = v * size.height * 0.9;
@@ -554,12 +668,9 @@ class SpectrumPainter extends CustomPainter {
         barWidth * 0.9,
         barHeight,
       );
-      final paint = Paint()
-        ..shader = const LinearGradient(
-          colors: [Colors.blueAccent, Colors.cyanAccent],
-          begin: Alignment.bottomCenter,
-          end: Alignment.topCenter,
-        ).createShader(rect);
+      paint.color =
+          Color.lerp(Colors.blueGrey, Colors.cyanAccent, v) ??
+          Colors.cyanAccent;
       canvas.drawRect(rect, paint);
     }
 
@@ -575,4 +686,58 @@ class SpectrumPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant SpectrumPainter oldDelegate) =>
       !listEquals(oldDelegate.fft, fft) || oldDelegate.peak != peak;
+}
+
+// Painter для логарифмических полос с peak hold.
+class LogSpectrumPainter extends CustomPainter {
+  final List<double> bands;
+  final List<double> peakHolds;
+  final Paint _peakPaint = Paint()
+    ..color = Colors.orangeAccent
+    ..strokeWidth = 2;
+
+  LogSpectrumPainter({required this.bands, required this.peakHolds});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(Offset.zero & size, Paint()..color = Colors.black);
+    if (bands.isEmpty) {
+      final tp = TextPainter(
+        text: const TextSpan(
+          text: 'Ожидание спектра...',
+          style: TextStyle(color: Colors.white54),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, const Offset(12, 12));
+      return;
+    }
+    final n = bands.length;
+    final barW = size.width / max(1, n);
+    final barPaint = Paint()..style = PaintingStyle.fill;
+    for (int i = 0; i < n; i++) {
+      final v = bands[i].clamp(0.0, 1.0);
+      final h = v * size.height * 0.92;
+      final x = i * barW;
+      final rect = Rect.fromLTWH(x, size.height - h, barW * 0.9, h);
+      barPaint.color =
+          Color.lerp(Colors.blueGrey, Colors.cyanAccent, v) ??
+          Colors.cyanAccent;
+      canvas.drawRect(rect, barPaint);
+
+      // Peak hold line
+      final peak = peakHolds[i].clamp(0.0, 1.0);
+      final peakY = size.height - peak * size.height * 0.92;
+      canvas.drawLine(
+        Offset(x, peakY),
+        Offset(x + barW * 0.9, peakY),
+        _peakPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant LogSpectrumPainter oldDelegate) =>
+      !listEquals(oldDelegate.bands, bands) ||
+      !listEquals(oldDelegate.peakHolds, peakHolds);
 }
